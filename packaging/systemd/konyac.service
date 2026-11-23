@@ -1,6 +1,6 @@
 [Unit]
 Description=konyac AI Translation Daemon
-Documentation=https://github.com/lh330250925/Konyac
+Documentation=https://github.com/lhxn/Konyac
 After=network.target
 
 [Service]
