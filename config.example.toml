@@ -5,13 +5,14 @@
 # The first [[service]] entry and its first model are used as defaults.
 # ==============================================================================
 
-[server]
-# Listener modes:
-#   - Both (default): keep both `unix` and `tcp`
-#   - Unix-only:      keep only `unix`
-#   - TCP-only:       keep only `tcp`
-unix = "/run/user/1000/konyac.sock"
-tcp = "127.0.0.1:16742"
+# Listener modes (when `[server]` is omitted, both Unix socket and TCP are enabled
+# automatically using `$XDG_RUNTIME_DIR/konyac.sock` on Linux or `$TMPDIR/konyac-<uid>/konyac.sock` on macOS):
+#   - Both (default): omit `[server]`, or set both `unix` and `tcp`
+#   - Unix-only:      uncomment `[server]` and set only `unix`
+#   - TCP-only:       uncomment `[server]` and set only `tcp`
+# [server]
+# unix = "/run/user/1000/konyac.sock"
+# tcp = "127.0.0.1:16742"
 
 # --- Local or LAN LLM service (e.g., Ollama 0.13.3+ with Responses API) ---
 # [[service]]

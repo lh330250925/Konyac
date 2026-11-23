@@ -80,9 +80,11 @@ konyac -i screenshot.png                         # 图片翻译
 首个 `[[service]]` 及其首个模型为默认项；`api_key` 可选，支持 `${ENV_VAR}` 注入环境变量。完整模板见 [`config.example.toml`](config.example.toml)。
 
 ```toml
-[server]
-unix = "/run/user/1000/konyac.sock" # 仅保留 unix / tcp 其一即为单栈监听
-tcp = "127.0.0.1:16742"
+# 默认同时启用自适应 Unix Socket（Linux: $XDG_RUNTIME_DIR/konyac.sock，macOS: $TMPDIR/konyac-<uid>/konyac.sock）
+# 与 TCP (127.0.0.1:16742)；如需单栈监听或改端口，取消注释 [server] 并只保留对应项：
+# [server]
+# unix = "/run/user/1000/konyac.sock"
+# tcp = "127.0.0.1:16742"
 
 [[service]]
 name = "ollama"
