@@ -150,13 +150,14 @@ jobs:
               --generate-notes
           fi
 
-      - name: Update Homebrew Tap (if HOMEBREW_TAP_TOKEN is configured)
+      - name: Update Homebrew Tap
         shell: bash
         env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
-            echo "HOMEBREW_TAP_TOKEN not set; skipping automatic Homebrew Tap update."
+          if [ -z "$HOMEBREW_TAP_DEPLOY_KEY" ] && [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "Neither HOMEBREW_TAP_DEPLOY_KEY nor HOMEBREW_TAP_TOKEN is set; skipping automatic Homebrew Tap update."
             exit 0
           fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
@@ -172,8 +173,25 @@ jobs:
           SHA_DARWIN_X86_64="$(sha_for x86_64-apple-darwin)"
           SHA_LINUX_ARM64="$(sha_for aarch64-unknown-linux-musl)"
           SHA_LINUX_X86_64="$(sha_for x86_64-unknown-linux-musl)"
+          for s in "$SHA_DARWIN_ARM64" "$SHA_DARWIN_X86_64" "$SHA_LINUX_ARM64" "$SHA_LINUX_X86_64"; do
+            if [ -z "$s" ]; then
+              echo "Missing SHA256 checksum for ${TAG}; aborting Homebrew Tap update." >&2
+              exit 1
+            fi
+          done
 
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/lh330250925/homebrew-tap.git" tap
+          if [ -n "$HOMEBREW_TAP_DEPLOY_KEY" ]; then
+            KEY_FILE="$(mktemp)"
+            KNOWN_HOSTS="$(mktemp)"
+            trap 'rm -f "$KEY_FILE" "$KNOWN_HOSTS"' EXIT
+            chmod 600 "$KEY_FILE"
+            printf '%s\n' "$HOMEBREW_TAP_DEPLOY_KEY" > "$KEY_FILE"
+            ssh-keyscan -t ed25519,rsa github.com > "$KNOWN_HOSTS" 2>/dev/null
+            export GIT_SSH_COMMAND="ssh -i $KEY_FILE -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"
+            git clone "git@github.com:lh330250925/homebrew-tap.git" tap
+          else
+            git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/lh330250925/homebrew-tap.git" tap
+          fi
           mkdir -p tap/Formula
           cat > tap/Formula/konyac.rb <<EOF
           class Konyac < Formula
