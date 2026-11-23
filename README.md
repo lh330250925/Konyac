@@ -1,5 +1,10 @@
 # konyac
 
+[![CI](https://github.com/lh330250925/Konyac/actions/workflows/ci.yml/badge.svg)](https://github.com/lh330250925/Konyac/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/lh330250925/Konyac)](https://github.com/lh330250925/Konyac/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey)
+
 基于 Rust 的轻量级 AI 翻译守护进程与命令行工具，面向 Linux 与 macOS，采用 Client / Daemon 架构，支持多协议上游与灵活监听模式。
 
 ## 特性
