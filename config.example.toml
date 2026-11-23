@@ -1,0 +1,62 @@
+# ==============================================================================
+# konyac (AI Translator Daemon) Example Configuration
+#
+# Copy to ~/.config/konyac/config.toml (or $XDG_CONFIG_HOME/konyac/config.toml).
+# The first [[service]] entry and its first model are used as defaults.
+# ==============================================================================
+
+[server]
+# Listener modes:
+#   - Both (default): keep both `unix` and `tcp`
+#   - Unix-only:      keep only `unix`
+#   - TCP-only:       keep only `tcp`
+unix = "/run/user/1000/konyac.sock"
+tcp = "127.0.0.1:16742"
+
+# --- Local or LAN LLM service (e.g., Ollama 0.13.3+ with Responses API) ---
+# [[service]]
+# name = "ollama"
+# protocol = "openai"                  # Protocol: openai, anthropic, gemini
+# base_url = "http://localhost:11434/v1"
+# models = ["qwen2.5:7b", "llama3.2"]
+
+# --- DeepSeek Responses API ---
+# [[service]]
+# name = "deepseek"
+# protocol = "openai"
+# base_url = "https://api.deepseek.com"
+# api_key = "${DEEPSEEK_API_KEY}"
+# models = ["deepseek-flash"]
+# thinking = "low"                     # Optional default: minimal, low, medium, high
+# prompt_cache = true                  # Optional: enable prompt cache routing key
+# max_tokens = 8192                    # Optional output token limit
+# headers = { "HTTP-Referer" = "https://example.com" } # Custom headers (supports ${ENV_VAR})
+
+# --- Anthropic Claude Messages API ---
+# [[service]]
+# name = "anthropic"
+# protocol = "anthropic"
+# base_url = "https://api.anthropic.com/v1"
+# api_key = "${ANTHROPIC_API_KEY}"
+# models = ["claude-opus-5-5"]
+# max_tokens = 8192
+# thinking = "low"                     # Mapped to output_config.effort
+# prompt_cache = true                  # Adds ephemeral cache_control breakpoints
+
+# --- Google Gemini Interactions API ---
+# [[service]]
+# name = "gemini"
+# protocol = "gemini"
+# base_url = "https://generativelanguage.googleapis.com"
+# api_key = "${GEMINI_API_KEY}"
+# models = ["gemini-3.8-flash"]
+# thinking = "low"                     # Mapped to generation_config.thinking_level
+# max_tokens = 8192                    # Mapped to generation_config.max_output_tokens
+
+[prompt]
+# Default target language (e.g., zh-CN, en, ja)
+target_lang = "zh-CN"
+
+# Uses the built-in system prompt unless a custom template is set.
+# Custom templates must keep the {target_lang} placeholder.
+# system = "Translate the input into {target_lang}."

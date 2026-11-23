@@ -4,23 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-arboard = { version = "3.7.0", features = ["wayland-data-control"] }
-axum = "0.8.9"
-bytes = "1.12.1"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
-clap_complete = "4.6.11"
-dirs = "7.0.0"
 eventsource-stream = "0.2.3"
-futures = "0.3.34"
-http-body-util = "0.1.5"
-hyper = { version = "1.12.0", features = ["client", "http1"] }
-hyper-util = { version = "0.1.21", features = ["tokio"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 reqwest = { version = "0.13.5", features = ["json", "stream"] }
+rustix = { version = "1.1.6", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokio = { version = "1.54.1", features = ["full"] }
-toml = "1.1.8"
-tower-http = { version = "0.7.1", features = ["cors"] }
+subtle = "2.6.1"
+tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde"] }
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

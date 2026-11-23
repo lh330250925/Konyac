@@ -1,32 +1,35 @@
 # konyac
 
-基于 Rust 的 AI 翻译工具，采用 Client / Daemon 架构，支持终端快捷交互与多协议后端。
+基于 Rust 的轻量级 AI 翻译守护进程与命令行工具，面向 Linux 与 macOS，采用 Client / Daemon 架构，支持多协议上游与灵活监听模式。
 
 ## 特性
 
-- **多协议原生适配**：统一抽象并原生支持 OpenAI（兼容各类本地与云端服务）、Anthropic Messages、Google Gemini 协议。
-- **IPC / 双通道故障回退**：服务端支持同时监听 Unix Domain Socket 与 TCP，客户端优先通过 Unix Socket 零开销直连，异常时自动平滑回退至 TCP。
-- **双模翻译适配引擎**：针对单词/短语自动激活 Markdown 词典模式（音标、释义、典型例句）；针对长句长文进行直接意译并严格保护代码及符号排版。
-- **系统剪贴板集成**：原生集成系统剪贴板（兼容 Wayland 与 X11），支持快速读取翻译（`-p`）与结果自动回写（`-C`）。
+- **多协议原生适配**：支持 OpenAI Responses、Anthropic Messages、Google Gemini Interactions 及兼容服务；原生统一映射输出上限（`max_tokens`）、推理深度（`thinking`）、前缀缓存（`prompt_cache`）、结构化输出（`json_schema`）与多模态图片翻译。
+- **高稳定代理层**：启用 HTTP/2 长连接空闲保活与首字节前瞬断/`429`/`502`/`503`/`504` 自动退避重试，支持按服务配置自定义加密敏感请求头（`headers`）。
+- **三种监听模式与自动回退**：服务端支持**仅 Unix Domain Socket**、**仅 TCP** 或**同时监听两者**；同时监听时客户端优先连接 Unix Socket，失败时自动回退至 TCP。
+- **简洁防注入翻译提示词**：针对独立单词/术语输出 Markdown 词条，针对长句长文直接意译并保护代码、标签与占位符排版。
 
 ## 安装与快速开始
 
 ### 安装
 
 ```bash
-cargo install --path .
+cargo install --path . --root "$HOME/.local"
 ```
 
-### 启动后台服务
+### 准备配置与启动后台服务
 
 ```bash
+# 复制示例配置并填入至少一个 [[service]]
+mkdir -p ~/.config/konyac
+cp config.example.toml ~/.config/konyac/config.toml
+
 # 直接前台启动
 konyac serve
 
-# 或通过 systemd (User Service) 后台常驻 (推荐)
+# 或通过 systemd (User Service) 后台常驻 (Linux 推荐)
 systemctl --user enable --now konyac
 ```
-> 首次运行会自动在 `~/.config/konyac/config.toml` 生成默认配置。
 
 #### 配置 systemd 用户服务 (`~/.config/systemd/user/konyac.service`)
 
@@ -65,14 +68,11 @@ konyac -s ollama -m qwen2.5:7b "Translate this"
 # 附带补充说明或上下文
 konyac -e "保留专业名词" "Zero-cost abstractions"
 
-# 从系统剪贴板读取并翻译 (paste)
-konyac -p
+# 调整推理深度（如极速查词用 minimal / low，长文精翻用 high）
+konyac --thinking low "Hello world"
 
-# 翻译并自动将结果写入剪贴板 (copy)
-konyac -C "Zero-cost abstractions"
-
-# 快捷流：翻译剪贴板内容并写回剪贴板
-konyac -p -C
+# 截屏 / 图片多模态翻译（可不传文本，直接翻译图片中的文字）
+konyac -i screenshot.png
 ```
 
 ## CLI 参考
@@ -86,53 +86,34 @@ konyac <SUBCOMMAND>
 
 | 参数 | 环境变量 | 说明 |
 | :--- | :--- | :--- |
-| `[TEXT]...` | - | 待翻译文本（为空时从 stdin 读取） |
-| `-t, --target <LANG>` | - | 目标语言（默认 `zh-CN`） |
-| `-s, --service <NAME>` | - | 指定 LLM 服务 |
-| `-m, --model <MODEL>` | - | 指定模型 |
+| `[TEXT]...` | - | 待翻译文本（为空时从 stdin 读取；若指定 `--image` 则文本可选） |
+| `-t, --target <LANG>` | - | 覆盖 Daemon 的默认目标语言 |
+| `-s, --service <NAME>` | - | 覆盖 Daemon 的默认 LLM 服务 |
+| `-m, --model <MODEL>` | - | 覆盖所选服务的默认模型 |
+| `--thinking <LEVEL>` | - | 覆盖服务的默认推理深度（`minimal`、`low`、`medium`、`high`） |
+| `-i, --image <FILE>` | - | 传入图片文件进行多模态翻译（支持 PNG/JPEG/WebP/GIF，可多次指定） |
 | `-e, --extra <TEXT>` | - | 额外上下文或翻译指令 |
-| `-p, --paste` | - | 从系统剪贴板读取待翻译文本 |
-| `-C, --copy` | - | 将翻译结果自动复制到系统剪贴板 |
-| `--no-spinner` | - | 禁用首字等待动画（默认开启） |
-| `-c, --config <FILE>` | `KONYAC_CONFIG` | 指定配置文件路径 |
-| `--endpoint <URL>` | `KONYAC_ENDPOINT` | 指定 Daemon 地址（支持 `http://...` 或 `unix:/path/to.sock`） |
+| `-c, --config <FILE>` | `KONYAC_CONFIG` | 指定 Daemon 的配置文件。CLI 可从中读取 `[server]` 来定位 Daemon |
+| `--endpoint <URL>` | `KONYAC_ENDPOINT` | 指定 Daemon 地址（支持 `http://...`、`https://...` 或 `unix:/path/to.sock`） |
+
+指定 `--endpoint` 或 `KONYAC_ENDPOINT` 后，CLI 可以直接连接，无需本地配置文件。
 
 ### 子命令
 
-- `konyac serve [-p <PORT>] [--host <HOST>] [-u <SOCKET>]`：启动守护进程
-- `konyac health`：检查服务状态
-- `konyac services`：查看已配置的服务和模型
-- `konyac completions <bash|zsh|fish|powershell|elvish>`：生成 Shell 自动补全脚本
-
-#### 安装 Shell 自动补全
-
-```bash
-# Zsh (添加到 fpath 目录，例如 ~/.zfunc)
-konyac completions zsh > ~/.zfunc/_konyac
-
-# Bash
-konyac completions bash > ~/.local/share/bash-completion/completions/konyac
-
-# Fish
-konyac completions fish > ~/.config/fish/completions/konyac.fish
-```
+- `konyac serve [--tcp <ADDR>] [-u <SOCKET>]`：启动守护进程
+- `konyac health`：查看服务状态、默认目标语言以及已配置的服务和模型
 
 ## 配置示例 (`~/.config/konyac/config.toml`)
 
+第一个 `[[service]]` 及其 `models` 列表中的首个模型即为默认服务与默认模型；`api_key` 始终可选（便于连接本机、局域网或内网容器服务）。
+
 ```toml
+# 监听模式：仅写 unix 即为仅 Unix；仅写 tcp 即为仅 TCP；两者都写则同时监听
 [server]
-# Unix domain socket 路径（Linux 默认推荐使用 $XDG_RUNTIME_DIR/konyac.sock）
 unix = "/run/user/1000/konyac.sock"
+tcp = "127.0.0.1:16742"
 
-[server.tcp]
-host = "127.0.0.1"
-port = 16742
-
-[default]
-service = "deepseek"
-model = "deepseek-chat"
-
-# 本地模型 (Ollama / vLLM / LMStudio，无需 API Key)
+# 本地或局域网模型（Ollama 0.13.3 或更高版本，无需 API Key）
 [[service]]
 name = "ollama"
 protocol = "openai"
@@ -143,13 +124,33 @@ models = ["qwen2.5:7b"]
 [[service]]
 name = "deepseek"
 protocol = "openai"
-base_url = "https://api.deepseek.com/v1"
+base_url = "https://api.deepseek.com"
 api_key = "${DEEPSEEK_API_KEY}"
-models = ["deepseek-chat"]
+models = ["deepseek-flash"]
+# 可选：统一输出 token 上限（Anthropic 默认 8192，OpenAI/Gemini 未配置时不限）
+# max_tokens = 8192
+# 可选：默认推理/思考深度（minimal / low / medium / high）
+# thinking = "low"
+# 可选：启用前缀缓存（OpenAI 自动生成 prompt_cache_key；Anthropic 添加 ephemeral cache_control）
+# prompt_cache = true
+# 可选：自定义上游请求头（值同样支持 ${ENV_VAR}，内部标记为敏感信息）
+# headers = { "HTTP-Referer" = "https://example.com" }
 
 [prompt]
 target_lang = "zh-CN"
 ```
+
+| `protocol` | 上游接口 | 官方 `base_url` 示例 |
+| :--- | :--- | :--- |
+| `openai` | OpenAI Responses `POST /v1/responses` | `https://api.openai.com/v1` |
+| `anthropic` | Anthropic Messages `POST /v1/messages`，版本 `2026-10-21` | `https://api.anthropic.com/v1` |
+| `gemini` | Gemini Interactions `POST /v1/interactions` | `https://generativelanguage.googleapis.com` |
+
+### TCP 访问
+
+默认的回环 TCP 接口接受 `localhost` 或回环 IP 作为 HTTP Host。配置 `KONYAC_TCP_TOKEN` 后，所有 TCP 请求都须携带 `Authorization: Bearer <token>`，CLI 会从同名环境变量读取它。监听非回环地址时，Daemon 要求设置该变量。通过网络访问时，可在 Daemon 前设置 HTTPS 反向代理，并用 `--endpoint https://...` 连接。
+
+Unix Socket 使用文件权限控制访问。默认路径使用 `$XDG_RUNTIME_DIR/konyac.sock`，没有运行时目录时使用临时目录下的每用户子目录。TCP 接口默认关闭浏览器跨域访问。
 
 ## API 接口文档
 
@@ -159,8 +160,7 @@ Daemon 提供标准的 HTTP 与 SSE 接口，便于集成到编辑器插件（Ne
 
 | 方法 | 路径 | 响应类型 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/health` | `application/json` | 服务健康检查与活动服务计数 |
-| `GET` | `/services` | `application/json` | 获取所有已加载的 LLM 服务及模型列表 |
+| `GET` | `/health` | `application/json` | 服务健康检查、默认目标语言及按配置顺序返回的服务和模型列表（首项为默认服务） |
 | `POST` | `/translate` | `text/event-stream` | 流式发起翻译请求（SSE） |
 
 ---
@@ -177,17 +177,21 @@ Accept: text/event-stream
 
 | 字段 | 类型 | 必填 | 说明 |
 | :--- | :--- | :---: | :--- |
-| `text` | `string` | 是 | 待翻译的原始文本，不能为空 |
-| `target_lang` | `string` | 是 | 目标语言标识（如 `zh-CN`, `en`, `ja`, `de` 等） |
-| `service` | `string` | 是 | 指定后端 LLM 服务标识（对应配置文件中 `[[service]].name`） |
-| `model` | `string` | 是 | 调用的模型名称（必须属于该服务已配置的 `models` 列表） |
-| `prompt` | `object` | 否 | 自定义提示词配置（见下表） |
-| `prompt.system` | `string` | 否 | 覆盖全局系统提示词（必须保留 `{target_lang}` 占位符） |
-| `prompt.extra` | `string` | 否 | 客户端附加指令或术语背景（追加至系统提示词后） |
+| `text` | `string` | 否 | 待翻译文本；若提供 `images` 时可省略或留空（两者不能同时为空） |
+| `images` | `array` | 否 | 图片列表（最多 4 张，总 base64 ≤ 12 MiB），每项为 `{"mime_type":"image/png","data":"<raw base64>"}`（支持 PNG/JPEG/WebP/GIF） |
+| `target_lang` | `string` | 否 | 默认使用 Daemon 的 `[prompt].target_lang`（内置值为 `zh-CN`） |
+| `service` | `string` | 否 | 默认使用第一个配置的 `[[service]]` |
+| `model` | `string` | 否 | 默认使用所选服务 `models` 列表中的首个模型。显式指定的模型须属于所选服务 |
+| `thinking` | `string` | 否 | 覆盖服务默认推理深度：`minimal`、`low`、`medium`、`high` |
+| `system` | `string` | 否 | 覆盖系统提示词；若包含 `{target_lang}` 会自动替换，未包含也可用于自定义或 `json_schema` 任务 |
+| `extra` | `string` | 否 | 客户端附加指令或术语背景（追加至系统提示词后） |
 | `history` | `array` | 否 | 历史上下文消息列表，用于多轮对话或连贯翻译 |
-| `history[].role` | `string` | 是 | 消息角色（`user` 或 `assistant`） |
+| `history[].role` | `string` | 是 | `user` 或 `assistant`（也接受 `model` 作为 `assistant` 的别名）。忽略大小写和首尾空白，其他角色返回 HTTP `400` |
 | `history[].content`| `string` | 是 | 消息正文 |
-| `json_schema` | `object` | 否 | 结构化输出规范，底层驱动会自动传递给上游模型 |
+| `json_schema` | `object` | 否 | 结构化输出规范，由上游按各自支持的规则处理。客户端可在收到完整流后校验结果 |
+| `cache_key` | `string` | 否 | OpenAI Responses API 的 `prompt_cache_key` 路由提示（覆盖默认生成 key，便于多轮/术语表会话复用缓存） |
+
+三协议特性映射：`json_schema` 对应 OpenAI `text.format`、Anthropic `output_config.format`、Gemini `response_format`；`thinking` 对应 OpenAI `reasoning.effort`、Anthropic `output_config.effort`、Gemini `generation_config.thinking_level`；`images` 对应 OpenAI `input_image`、Anthropic `image`（base64 source）、Gemini `image` 内容块。
 
 #### 响应格式 (Response)
 
@@ -199,116 +203,62 @@ Accept: text/event-stream
     data: ，
     data: 世界
     ```
-  - 若在流式传输过程中上游抛出异常，会下发命名错误事件：
+  - 翻译完成时发送 `event: done`，其数据为 `[DONE]`。
+  - 如果上游报错、提前断流或达到输出限制，会发送 `event: error`。其数据是与 HTTP 错误相同的 JSON 对象：
     ```text
     event: error
-    data: Rate limit exceeded
+    data: {"code":"output_truncated","error":"Responses API output incomplete: max_output_tokens"}
     ```
   - 内置保活机制（Keep-Alive），防止网络中间代理超时断开。
-- **`400 Bad Request`**：请求参数缺失或非法（如必填字段为空、模型未在该服务中配置），返回：
-  ```json
-  { "error": "Field 'text' cannot be empty" }
-  ```
-- **`502 Bad Gateway`**：上游 LLM 服务连接失败或返回错误，返回：
-  ```json
-  { "error": "Upstream error: Connection refused" }
-  ```
+- **`400 Bad Request`**：`text` 与 `images` 同时为空、图片格式或 base64 非法、字段为空、服务未知或模型未在所选服务中配置。
+- **`422 Unprocessable Entity`**：JSON 字段类型不符合要求或无法解析。
+- **`502 Bad Gateway`**：上游 LLM 服务连接失败或返回错误。
+
+| 错误码 | 含义 |
+| :--- | :--- |
+| `invalid_request` | 请求体缺失字段、类型错误或包含空值等非法参数 |
+| `service_not_configured` / `model_not_configured` | 服务或模型未配置 |
+| `unauthorized` / `forbidden` | TCP 鉴权或访问限制拒绝了请求 |
+| `upstream_timeout` | 等待模型服务连接、响应或继续输出时超时 |
+| `rate_limited` | 模型服务触发频率或额度限制 |
+| `output_truncated` | 达到模型输出或上下文上限。流式译文可标记为未完成 |
+| `content_blocked` | 模型拒绝请求或阻止输出 |
+| `upstream_interrupted` | 模型流在完成前断开 |
+| `upstream_error` | 其他模型服务错误 |
 
 #### 请求示例
 
-##### 1. 基础翻译请求
 ```bash
-# TCP 访问
+# TCP 访问，使用 Daemon 的默认值
 curl -N -X POST http://127.0.0.1:16742/translate \
   -H "Content-Type: application/json" \
-  -d '{
-    "text": "Hello world",
-    "target_lang": "zh-CN",
-    "service": "deepseek",
-    "model": "deepseek-chat"
-  }'
+  -d '{"text":"Hello world"}'
 
-# Unix Domain Socket 访问 (零网络栈开销)
+# Unix Domain Socket 访问，只覆盖目标语言
 curl -N -X POST --unix-socket /run/user/1000/konyac.sock http://localhost/translate \
   -H "Content-Type: application/json" \
-  -d '{
-    "text": "Hello world",
-    "target_lang": "zh-CN",
-    "service": "deepseek",
-    "model": "deepseek-chat"
-  }'
+  -d '{"text":"Hello world","target_lang":"ja"}'
 ```
 
-##### 2. 携带业务上下文与翻译指令 (`prompt.extra`)
-```bash
-curl -N -X POST http://127.0.0.1:16742/translate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "The runtime manages cooperative scheduling.",
-    "target_lang": "zh-CN",
-    "service": "deepseek",
-    "model": "deepseek-chat",
-    "prompt": {
-      "extra": "专有名词保留英文，语境为操作系统内核开发"
-    }
-  }'
-```
+### 状态与服务查询 `GET /health`
 
-##### 3. 携带多轮对话历史 (`history`)
-```bash
-curl -N -X POST http://127.0.0.1:16742/translate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "What about its memory safety?",
-    "target_lang": "zh-CN",
-    "service": "deepseek",
-    "model": "deepseek-chat",
-    "history": [
-      { "role": "user", "content": "Rust provides fearless concurrency." },
-      { "role": "assistant", "content": "Rust 提供了无畏并发。" }
-    ]
-  }'
-```
-
----
-
-### 辅助管理接口
-
-#### 1. `GET /health`
-```bash
-# TCP
-curl -s http://127.0.0.1:16742/health
-
-# Unix Domain Socket
-curl -s --unix-socket /run/user/1000/konyac.sock http://localhost/health
-```
 ```json
 {
   "status": "ok",
   "version": "0.1.0",
-  "services_count": 2
+  "target_lang": "zh-CN",
+  "services": [
+    {
+      "name": "deepseek",
+      "protocol": "openai",
+      "models": ["deepseek-flash"],
+      "thinking": "low"
+    },
+    {
+      "name": "ollama",
+      "protocol": "openai",
+      "models": ["qwen2.5:7b"]
+    }
+  ]
 }
-```
-
-#### 2. `GET /services`
-```bash
-# TCP
-curl -s http://127.0.0.1:16742/services
-
-# Unix Domain Socket
-curl -s --unix-socket /run/user/1000/konyac.sock http://localhost/services
-```
-```json
-[
-  {
-    "name": "deepseek",
-    "protocol": "openai",
-    "configured_models": ["deepseek-chat"]
-  },
-  {
-    "name": "ollama",
-    "protocol": "openai",
-    "configured_models": ["qwen2.5:7b"]
-  }
-]
 ```

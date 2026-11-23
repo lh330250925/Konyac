@@ -1,404 +1,264 @@
-use crate::llm::ServiceInfo;
-use crate::server::types::{ErrorResponse, HealthResponse, TranslateRequest};
-use axum::http::StatusCode;
+use crate::api::{ErrorCode, HealthResponse, KonyacError, SSE_DONE, SSE_ERROR, TranslateRequest};
+use crate::config::{ServerConfig, tcp_authorization};
 use eventsource_stream::Eventsource;
-use futures::StreamExt;
-use http_body_util::BodyExt;
-use std::path::PathBuf;
+use futures_util::StreamExt;
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::{StatusCode, Url};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// Endpoint address for the translation daemon.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_TIMEOUT: Duration = Duration::from_secs(135);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Endpoint {
+enum Endpoint {
     Unix(PathBuf),
-    Tcp(String, u16),
+    Tcp(Url),
 }
 
 impl std::fmt::Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unix(p) => write!(f, "unix:{}", p.display()),
-            Self::Tcp(host, port) => write!(f, "http://{host}:{port}"),
+            Self::Unix(path) => write!(f, "unix:{}", path.display()),
+            Self::Tcp(url) => write!(f, "{url}"),
         }
     }
 }
 
 impl Endpoint {
-    /// Parses an endpoint string into Unix socket path or TCP address.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        let trimmed = s.trim().trim_end_matches('/');
-        if trimmed.is_empty() {
-            return Err("Endpoint cannot be empty".to_string());
-        }
-
-        if let Some(path) = trimmed.strip_prefix("unix:") {
-            let p = PathBuf::from(path);
-            if p.as_os_str().is_empty() {
-                return Err("Unix socket path cannot be empty".to_string());
+    fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if let Some(path) = value.strip_prefix("unix:") {
+            if path.is_empty() {
+                return Err("Unix socket path cannot be empty".into());
             }
-            return Ok(Self::Unix(p));
+            return Ok(Self::Unix(PathBuf::from(path)));
         }
 
-        if trimmed.starts_with('/') || trimmed.starts_with("./") || trimmed.ends_with(".sock") {
-            return Ok(Self::Unix(PathBuf::from(trimmed)));
+        let raw = if value.contains("://") {
+            value.to_owned()
+        } else {
+            format!("http://{value}")
+        };
+        let url = Url::parse(&raw).map_err(|e| format!("Invalid daemon endpoint: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err("Daemon endpoint scheme must be http, https, or unix".into());
         }
-
-        let without_proto = trimmed
-            .strip_prefix("http://")
-            .or_else(|| trimmed.strip_prefix("https://"))
-            .unwrap_or(trimmed);
-
-        let (host, port_str) = without_proto.split_once(':').unwrap_or((without_proto, "16742"));
-        let port: u16 = port_str
-            .parse()
-            .map_err(|_| format!("Invalid port in endpoint: '{port_str}'"))?;
-
-        Ok(Self::Tcp(host.to_string(), port))
+        if !url.has_host()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || !matches!(url.path(), "" | "/")
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("Daemon endpoint must contain only scheme, host, and optional port".into());
+        }
+        Ok(Self::Tcp(url))
     }
 }
 
-/// Resolved daemon endpoint with optional fallback.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EndpointResolution {
-    pub primary: Endpoint,
-    pub fallback: Option<Endpoint>,
-}
-
-/// Client error types
 #[derive(Debug)]
 pub enum ClientError {
-    /// Failed to connect to the daemon
     DaemonUnreachable {
         endpoint: String,
         source: String,
     },
-    /// Daemon returned non-2xx HTTP status and error message
     HttpStatus {
         status: StatusCode,
-        message: String,
+        error: KonyacError,
     },
-    /// SSE event stream error
+    DaemonStream(KonyacError),
     Stream(String),
-    /// HTTP network transport error
-    Request(String),
-    /// JSON serialization/deserialization error
-    Json(serde_json::Error),
-}
-
-impl ClientError {
-    /// Returns true if the daemon could not be reached (connection error).
-    pub fn is_unreachable(&self) -> bool {
-        matches!(self, Self::DaemonUnreachable { .. })
-    }
+    Output(std::io::Error),
+    Request(reqwest::Error),
 }
 
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DaemonUnreachable { endpoint, source } => {
-                write!(
-                    f,
-                    "Error: Could not connect to konyac daemon at {endpoint} ({source}).\n\
-                     Is the daemon running?\n\n\
-                     To start the daemon:\n  konyac serve\n\
-                     Or with systemd:\n  systemctl --user start konyac"
-                )
+            Self::DaemonUnreachable { endpoint, source } => write!(
+                f,
+                "Could not connect to konyac daemon at {endpoint} ({source})."
+            ),
+            Self::HttpStatus { status, error } => {
+                write!(f, "Daemon returned error ({status}): {error}")
             }
-            Self::HttpStatus { status, message } => {
-                write!(f, "Daemon returned error ({status}): {message}")
-            }
-            Self::Stream(msg) => write!(f, "Stream error: {msg}"),
+            Self::DaemonStream(error) => write!(f, "Stream error: {error}"),
+            Self::Stream(message) => write!(f, "Stream error: {message}"),
+            Self::Output(err) => write!(f, "Could not write translation output: {err}"),
             Self::Request(err) => write!(f, "HTTP error: {err}"),
-            Self::Json(err) => write!(f, "JSON error: {err}"),
         }
     }
 }
 
 impl std::error::Error for ClientError {}
 
-/// Resolves the daemon endpoint, prioritizing Unix Domain Socket when available.
-pub fn resolve_endpoint(
-    cli_endpoint: Option<&str>,
-    server_cfg: &crate::config::RuntimeServerConfig,
-) -> Result<EndpointResolution, String> {
-    if let Some(ep) = cli_endpoint {
-        let primary = Endpoint::parse(ep)?;
-        return Ok(EndpointResolution {
-            primary,
-            fallback: None,
-        });
-    }
-
-    #[cfg(unix)]
-    if let Some(ref unix_path) = server_cfg.unix {
-        let primary = Endpoint::Unix(unix_path.clone());
-        let fallback = server_cfg
-            .tcp
-            .as_ref()
-            .map(|t| Endpoint::Tcp(t.host.clone(), t.port));
-        return Ok(EndpointResolution { primary, fallback });
-    }
-
-    if let Some(ref tcp) = server_cfg.tcp {
-        return Ok(EndpointResolution {
-            primary: Endpoint::Tcp(tcp.host.clone(), tcp.port),
-            fallback: None,
-        });
-    }
-
-    Err("No server endpoint configured (neither unix socket nor TCP enabled)".to_string())
+fn decode_daemon_error(payload: String) -> KonyacError {
+    serde_json::from_str(&payload).unwrap_or_else(|_| KonyacError::new(ErrorCode::Unknown, payload))
 }
 
-enum ClientStream {
-    #[cfg(unix)]
-    Unix(tokio::net::UnixStream),
-    Tcp(tokio::net::TcpStream),
+type ClientInitError = Box<dyn std::error::Error>;
+
+fn resolve_endpoints(server: &ServerConfig) -> Result<(Endpoint, Option<Endpoint>), String> {
+    let tcp = server.tcp.as_deref().map(Endpoint::parse).transpose()?;
+    if let Some(path) = &server.unix {
+        return Ok((Endpoint::Unix(path.clone()), tcp));
+    }
+    tcp.map(|endpoint| (endpoint, None))
+        .ok_or_else(|| "No supported daemon endpoint is configured".into())
 }
 
-macro_rules! delegate_stream {
-    ($self:ident, $method:ident $(, $arg:expr)*) => {
-        match $self.get_mut() {
-            #[cfg(unix)]
-            Self::Unix(s) => std::pin::Pin::new(s).$method($($arg),*),
-            Self::Tcp(s) => std::pin::Pin::new(s).$method($($arg),*),
+async fn send_to(
+    endpoint: &Endpoint,
+    authorization: Option<&HeaderValue>,
+    path: &str,
+    payload: Option<&TranslateRequest>,
+) -> Result<reqwest::Response, ClientError> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(STREAM_TIMEOUT);
+
+    let mut url = match endpoint {
+        Endpoint::Unix(socket_path) => {
+            builder = builder.unix_socket(socket_path.clone());
+            Url::parse("http://localhost").expect("static localhost URL")
+        }
+        Endpoint::Tcp(base_url) => {
+            if let Some(auth) = authorization {
+                let mut headers = HeaderMap::new();
+                headers.insert(AUTHORIZATION, auth.clone());
+                builder = builder.default_headers(headers);
+            }
+            base_url.clone()
         }
     };
-}
+    url.set_path(path);
 
-impl tokio::io::AsyncRead for ClientStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        delegate_stream!(self, poll_read, cx, buf)
-    }
-}
-
-impl tokio::io::AsyncWrite for ClientStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        delegate_stream!(self, poll_write, cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        delegate_stream!(self, poll_flush, cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        delegate_stream!(self, poll_shutdown, cx)
-    }
-}
-
-async fn send_request(
-    endpoint: &Endpoint,
-    method: axum::http::Method,
-    uri: &str,
-    body: Option<bytes::Bytes>,
-) -> Result<hyper::Response<hyper::body::Incoming>, ClientError> {
-    let stream = match endpoint {
-        #[cfg(unix)]
-        Endpoint::Unix(p) => ClientStream::Unix(tokio::net::UnixStream::connect(p).await.map_err(|e| {
+    let client = builder.build().map_err(ClientError::Request)?;
+    let request = match payload {
+        Some(payload) => client
+            .post(url)
+            .header(ACCEPT, "text/event-stream")
+            .json(payload),
+        None => client.get(url).timeout(CONNECT_TIMEOUT),
+    };
+    request.send().await.map_err(|e| {
+        if e.is_connect() {
             ClientError::DaemonUnreachable {
                 endpoint: endpoint.to_string(),
                 source: e.to_string(),
             }
-        })?),
-        #[cfg(not(unix))]
-        Endpoint::Unix(_) => {
-            return Err(ClientError::DaemonUnreachable {
-                endpoint: endpoint.to_string(),
-                source: "Unix domain sockets are not supported on this platform".into(),
-            });
+        } else {
+            ClientError::Request(e)
         }
-        Endpoint::Tcp(host, port) => ClientStream::Tcp(
-            tokio::net::TcpStream::connect((host.as_str(), *port))
-                .await
-                .map_err(|e| ClientError::DaemonUnreachable {
-                    endpoint: endpoint.to_string(),
-                    source: e.to_string(),
-                })?,
-        ),
-    };
-
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| ClientError::Request(e.to_string()))?;
-
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
-    let mut builder = hyper::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(axum::http::header::HOST, "localhost");
-
-    let req = if let Some(bytes) = body {
-        builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
-        builder
-            .body(http_body_util::Full::new(bytes))
-            .map_err(|e| ClientError::Request(e.to_string()))?
-    } else {
-        builder
-            .body(http_body_util::Full::default())
-            .map_err(|e| ClientError::Request(e.to_string()))?
-    };
-
-    sender
-        .send_request(req)
-        .await
-        .map_err(|e| ClientError::Request(e.to_string()))
+    })
 }
 
-async fn extract_error(res: hyper::Response<hyper::body::Incoming>) -> ClientError {
-    let status = res.status();
-    let bytes = match res.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => return ClientError::Request(e.to_string()),
-    };
-    let message = serde_json::from_slice::<ErrorResponse>(&bytes)
-        .map(|e| e.error)
-        .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
-    ClientError::HttpStatus { status, message }
-}
-
-/// Lightweight, stateless hyper-based daemon client.
 pub struct KonyacClient {
     primary: Endpoint,
     fallback: Option<Endpoint>,
+    authorization: Option<HeaderValue>,
 }
 
 impl KonyacClient {
-    /// Creates a client with primary endpoint and optional fallback.
-    pub fn new(primary: Endpoint, fallback: Option<Endpoint>) -> Self {
-        Self { primary, fallback }
+    fn new(
+        primary: Endpoint,
+        fallback: Option<Endpoint>,
+        authorization: Option<HeaderValue>,
+    ) -> Self {
+        Self {
+            primary,
+            fallback,
+            authorization,
+        }
     }
 
-    /// Creates a client resolved from the server configuration and optional CLI endpoint override.
-    pub fn from_config(
-        server_cfg: &crate::config::ServerConfig,
+    pub fn from_options(
+        config_path: Option<&Path>,
         cli_endpoint: Option<&str>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let runtime_cfg = server_cfg.clone().into_runtime()?;
-        let resolution = resolve_endpoint(cli_endpoint, &runtime_cfg)?;
-        Ok(Self::new(resolution.primary, resolution.fallback))
+    ) -> Result<Self, ClientInitError> {
+        let (primary, fallback) = match cli_endpoint {
+            Some(endpoint) => (Endpoint::parse(endpoint)?, None),
+            None => resolve_endpoints(&ServerConfig::load_for_client(config_path)?)?,
+        };
+        let authorization = if matches!(primary, Endpoint::Tcp(_)) || fallback.is_some() {
+            tcp_authorization()?
+        } else {
+            None
+        };
+        Ok(Self::new(primary, fallback, authorization))
     }
 
-    async fn fetch_json<T: serde::de::DeserializeOwned>(
-        ep: &Endpoint,
-        path: &str,
-    ) -> Result<T, ClientError> {
-        let res = send_request(ep, axum::http::Method::GET, path, None).await?;
-        if !res.status().is_success() {
-            return Err(extract_error(res).await);
-        }
-
-        let bytes = res
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| ClientError::Request(e.to_string()))?
-            .to_bytes();
-
-        serde_json::from_slice(&bytes).map_err(ClientError::Json)
-    }
-
-    async fn request_json<T: serde::de::DeserializeOwned>(
+    async fn request(
         &self,
         path: &str,
-    ) -> Result<T, ClientError> {
-        match Self::fetch_json(&self.primary, path).await {
-            Ok(val) => Ok(val),
-            Err(e) if e.is_unreachable() => {
-                if let Some(ref fb) = self.fallback {
-                    Self::fetch_json(fb, path).await
-                } else {
-                    Err(e)
-                }
+        payload: Option<&TranslateRequest>,
+    ) -> Result<reqwest::Response, ClientError> {
+        let auth = self.authorization.as_ref();
+        let response = match send_to(&self.primary, auth, path, payload).await {
+            Err(ClientError::DaemonUnreachable { .. }) if let Some(fallback) = &self.fallback => {
+                send_to(fallback, auth, path, payload).await?
             }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Queries GET /health
-    pub async fn health(&self) -> Result<HealthResponse, ClientError> {
-        self.request_json("/health").await
-    }
-
-    /// Queries GET /services
-    pub async fn services(&self) -> Result<Vec<ServiceInfo>, ClientError> {
-        self.request_json("/services").await
-    }
-
-    async fn connect_translate(
-        ep: &Endpoint,
-        payload: bytes::Bytes,
-    ) -> Result<hyper::body::Incoming, ClientError> {
-        let res = send_request(ep, axum::http::Method::POST, "/translate", Some(payload)).await?;
-        if !res.status().is_success() {
-            return Err(extract_error(res).await);
-        }
-        Ok(res.into_body())
-    }
-
-    /// Queries POST /translate for SSE streaming translation
-    pub async fn translate<F>(
-        &self,
-        req: &TranslateRequest,
-        mut on_chunk: F,
-    ) -> Result<(), ClientError>
-    where
-        F: FnMut(&str),
-    {
-        let payload = bytes::Bytes::from(serde_json::to_vec(req).map_err(ClientError::Json)?);
-
-        let body = match Self::connect_translate(&self.primary, payload.clone()).await {
-            Ok(b) => b,
-            Err(e) if e.is_unreachable() => {
-                if let Some(ref fb) = self.fallback {
-                    Self::connect_translate(fb, payload).await?
-                } else {
-                    return Err(e);
-                }
-            }
-            Err(e) => return Err(e),
+            result => result?,
         };
 
-        let mut stream = body
-            .into_data_stream()
-            .map(|chunk_res| chunk_res.map_err(std::io::Error::other))
-            .eventsource();
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let body = response.text().await.map_err(ClientError::Request)?;
+        Err(ClientError::HttpStatus {
+            status,
+            error: decode_daemon_error(body),
+        })
+    }
 
-        while let Some(event_res) = stream.next().await {
-            let event = event_res.map_err(|e| ClientError::Stream(e.to_string()))?;
-            if event.event == "error" {
-                return Err(ClientError::Stream(event.data));
+    pub async fn health(&self) -> Result<HealthResponse, ClientError> {
+        self.request("/health", None)
+            .await?
+            .json()
+            .await
+            .map_err(ClientError::Request)
+    }
+
+    pub async fn translate(
+        &self,
+        req: &TranslateRequest,
+        mut on_chunk: impl FnMut(&str) -> std::io::Result<()>,
+    ) -> Result<(), ClientError> {
+        let response = self.request("/translate", Some(req)).await?;
+        let mut stream = response.bytes_stream().eventsource();
+
+        while let Some(event) = tokio::time::timeout(STREAM_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| {
+                ClientError::Stream("Timed out waiting for daemon translation data".into())
+            })?
+        {
+            let event = event.map_err(|e| ClientError::Stream(e.to_string()))?;
+            match event.event.as_str() {
+                SSE_DONE => return Ok(()),
+                SSE_ERROR => {
+                    return Err(ClientError::DaemonStream(decode_daemon_error(event.data)));
+                }
+                "message" => on_chunk(&event.data).map_err(ClientError::Output)?,
+                _ => {}
             }
-            if event.data == "[DONE]" {
-                break;
-            }
-            on_chunk(&event.data);
         }
 
-        Ok(())
+        Err(ClientError::Stream(
+            "Daemon stream ended before a completion event".into(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RuntimeServerConfig;
-    use crate::config::server::Tcp;
+    use crate::api::ServiceInfo;
     use axum::Json;
     use axum::Router;
     use axum::response::IntoResponse;
@@ -408,29 +268,44 @@ mod tests {
 
     #[test]
     fn test_resolve_endpoint() {
-        let server_cfg = RuntimeServerConfig {
-            tcp: Some(Tcp {
-                host: "127.0.0.1".into(),
-                port: 16742,
-            }),
+        let server_cfg = ServerConfig {
+            tcp: Some("127.0.0.1:16742".into()),
             unix: Some(PathBuf::from("/tmp/konyac_test.sock")),
         };
 
         assert_eq!(
-            resolve_endpoint(Some("127.0.0.1:18000"), &server_cfg).unwrap(),
-            EndpointResolution {
-                primary: Endpoint::Tcp("127.0.0.1".into(), 18000),
-                fallback: None,
-            }
+            Endpoint::parse("127.0.0.1:18000").unwrap().to_string(),
+            "http://127.0.0.1:18000/"
         );
-        #[cfg(unix)]
         assert_eq!(
-            resolve_endpoint(None, &server_cfg).unwrap(),
-            EndpointResolution {
-                primary: Endpoint::Unix(PathBuf::from("/tmp/konyac_test.sock")),
-                fallback: Some(Endpoint::Tcp("127.0.0.1".into(), 16742)),
-            }
+            resolve_endpoints(&server_cfg).unwrap(),
+            (
+                Endpoint::Unix(PathBuf::from("/tmp/konyac_test.sock")),
+                Some(Endpoint::parse("http://127.0.0.1:16742").unwrap()),
+            )
         );
+        assert_eq!(
+            Endpoint::parse("http://[::1]:16742").unwrap().to_string(),
+            "http://[::1]:16742/"
+        );
+        assert_eq!(
+            Endpoint::parse("https://localhost:443")
+                .unwrap()
+                .to_string(),
+            "https://localhost/"
+        );
+        assert_eq!(
+            Endpoint::parse("unix:/tmp/k.sock").unwrap().to_string(),
+            "unix:/tmp/k.sock"
+        );
+        for invalid in [
+            "unix:",
+            "ftp://localhost",
+            "http://localhost/path",
+            "http://localhost:invalid",
+        ] {
+            assert!(Endpoint::parse(invalid).is_err(), "{invalid}");
+        }
     }
 
     fn mock_app() -> Router {
@@ -441,18 +316,14 @@ mod tests {
                     Json(HealthResponse {
                         status: "ok".into(),
                         version: "0.1.0".into(),
-                        services_count: 1,
+                        target_lang: "zh-CN".into(),
+                        services: vec![ServiceInfo {
+                            name: "mock".into(),
+                            protocol: "openai".into(),
+                            models: vec!["m1".into()],
+                            thinking: None,
+                        }],
                     })
-                }),
-            )
-            .route(
-                "/services",
-                get(|| async {
-                    Json(vec![ServiceInfo {
-                        name: "mock".into(),
-                        protocol: "openai".into(),
-                        configured_models: vec!["m1".into()],
-                    }])
                 }),
             )
             .route(
@@ -461,67 +332,129 @@ mod tests {
                     if req.text == "bad" {
                         return (
                             StatusCode::BAD_REQUEST,
-                            Json(ErrorResponse {
-                                error: "bad text".into(),
-                            }),
+                            Json(serde_json::json!({"error":"bad text"})),
                         )
                             .into_response();
                     }
-                    let stream = futures::stream::iter(vec![
-                        Ok::<_, Infallible>(Event::default().data("result")),
-                        Ok::<_, Infallible>(Event::default().data("[DONE]")),
-                    ]);
+                    let mut events = vec![Ok::<_, Infallible>(Event::default().data("result"))];
+                    match req.text.as_str() {
+                        "truncated" => {}
+                        "output limit" => events.push(Ok(Event::default()
+                            .event(SSE_ERROR)
+                            .json_data(KonyacError::new(
+                                ErrorCode::OutputTruncated,
+                                "model output limit",
+                            ))
+                            .unwrap())),
+                        _ => events.extend([
+                            Ok(Event::default().data("[DONE]")),
+                            Ok(Event::default().data("end")),
+                            Ok(Event::default().event(SSE_DONE).data("[DONE]")),
+                        ]),
+                    }
+                    let stream = futures_util::stream::iter(events);
                     Sse::new(stream).into_response()
                 }),
             )
     }
 
+    async fn spawn_mock() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock_app()).await.unwrap() });
+        addr
+    }
+
     #[tokio::test]
     async fn test_client_tcp_and_errors() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(listener, mock_app()).await.unwrap();
-        });
-
-        let client = KonyacClient::new(Endpoint::Tcp("127.0.0.1".into(), port), None);
-        assert_eq!(client.health().await.unwrap().status, "ok");
-        assert_eq!(client.services().await.unwrap().len(), 1);
+        let addr = spawn_mock().await;
+        let client = KonyacClient::new(Endpoint::parse(&addr.to_string()).unwrap(), None, None);
+        let health = client.health().await.unwrap();
+        assert_eq!(health.status, "ok");
+        assert_eq!(health.target_lang, "zh-CN");
+        assert_eq!(health.services.len(), 1);
 
         let mut out = String::new();
         let req = TranslateRequest {
             text: "hi".into(),
-            target_lang: "zh".into(),
-            prompt: None,
-            history: None,
-            service: "mock".into(),
-            model: "m1".into(),
-            json_schema: None,
+            ..Default::default()
         };
-        client.translate(&req, |c| out.push_str(c)).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({ "text": "hi" })
+        );
+        client
+            .translate(&req, |c| {
+                out.push_str(c);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(out, "result[DONE]end");
+
+        let truncated_req = TranslateRequest {
+            text: "truncated".into(),
+            ..req.clone()
+        };
+        let truncated = client
+            .translate(&truncated_req, |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(truncated, ClientError::Stream(error) if error.contains("before a completion event"))
+        );
+
+        let output_limit = TranslateRequest {
+            text: "output limit".into(),
+            ..req.clone()
+        };
+        out.clear();
+        let error = client
+            .translate(&output_limit, |chunk| {
+                out.push_str(chunk);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
         assert_eq!(out, "result");
+        assert!(
+            matches!(&error, ClientError::DaemonStream(error) if error.code == ErrorCode::OutputTruncated)
+        );
+        assert_eq!(error.to_string(), "Stream error: model output limit");
 
         let bad_req = TranslateRequest {
             text: "bad".into(),
             ..req
         };
-        assert!(client.translate(&bad_req, |_| {}).await.is_err());
+        let error = client.translate(&bad_req, |_| Ok(())).await.unwrap_err();
+        assert!(
+            matches!(error, ClientError::HttpStatus { status: StatusCode::BAD_REQUEST, error }
+            if error.code == ErrorCode::Unknown && error.message == "bad text")
+        );
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn decodes_legacy_and_future_error_payloads() {
+        for payload in [
+            "old error",
+            r#"{"error":"old error"}"#,
+            r#"{"code":"future_daemon_code","error":"old error"}"#,
+        ] {
+            let error = decode_daemon_error(payload.into());
+            assert_eq!(error, KonyacError::new(ErrorCode::Unknown, "old error"));
+        }
+    }
+
     #[tokio::test]
     async fn test_client_unix_and_fallback() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(listener, mock_app()).await.unwrap();
-        });
+        let addr = spawn_mock().await;
 
         let dead_sock =
             std::env::temp_dir().join(format!("konyac_dead_{}.sock", std::process::id()));
         let client = KonyacClient::new(
             Endpoint::Unix(dead_sock),
-            Some(Endpoint::Tcp("127.0.0.1".into(), port)),
+            Some(Endpoint::parse(&addr.to_string()).unwrap()),
+            None,
         );
         assert_eq!(client.health().await.unwrap().status, "ok");
 
@@ -532,15 +465,20 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(u_listener, mock_app()).await.unwrap();
         });
-        let u_client = KonyacClient::new(Endpoint::Unix(live_sock.clone()), None);
+        let u_client = KonyacClient::new(Endpoint::Unix(live_sock.clone()), None, None);
         assert_eq!(u_client.health().await.unwrap().status, "ok");
         let _ = std::fs::remove_file(&live_sock);
     }
 
     #[tokio::test]
     async fn test_client_unreachable() {
-        let client = KonyacClient::new(Endpoint::Tcp("127.0.0.1".into(), 59998), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let endpoint = Endpoint::parse(&format!("127.0.0.1:{port}")).unwrap();
+        let client = KonyacClient::new(endpoint, None, None);
         let err = client.health().await.unwrap_err();
-        assert!(err.is_unreachable());
+        assert!(matches!(err, ClientError::DaemonUnreachable { .. }));
     }
 }
