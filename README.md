@@ -18,6 +18,32 @@
 
 ### 安装
 
+#### Homebrew（macOS 与 Linux）
+
+```bash
+brew install lh330250925/tap/konyac
+
+# 可选：通过 brew services 启动后台守护进程
+brew services start konyac
+```
+
+#### 预编译二进制（GitHub Releases）
+
+前往 [Releases 页面](https://github.com/lh330250925/Konyac/releases/latest) 下载对应架构的压缩包（Linux 为 musl 静态二进制，压缩包内附带 `konyac.service` 与 `config.example.toml`）。
+
+#### Arch Linux（仓库内 `PKGBUILD`）
+
+```bash
+git clone https://github.com/lh330250925/Konyac.git
+cd Konyac/packaging/aur
+makepkg -si
+systemctl --user enable --now konyac
+```
+
+> 注：待 AUR 恢复新账号注册后，将同步上线 `konyac-bin` 包。
+
+#### 从源码安装
+
 ```bash
 cargo install --path . --root "$HOME/.local"
 ```

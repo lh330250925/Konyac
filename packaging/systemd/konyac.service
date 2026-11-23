@@ -1,0 +1,14 @@
+[Unit]
+Description=konyac AI Translation Daemon
+Documentation=https://github.com/lh330250925/Konyac
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/konyac serve
+Restart=on-failure
+RestartSec=3s
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

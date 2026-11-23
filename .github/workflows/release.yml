@@ -1,0 +1,242 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (defaults to current ref name)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            musl_docker: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            musl_docker: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            musl_docker: false
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            musl_docker: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine release tag
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build static Linux musl binary
+        if: matrix.musl_docker
+        shell: bash
+        run: |
+          TARGET="${{ matrix.target }}"
+          UPPER_TARGET="$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')"
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            -e TARGET="$TARGET" \
+            -e "CARGO_TARGET_${UPPER_TARGET}_RUSTFLAGS=-C target-feature=+crt-static" \
+            rust:alpine \
+            sh -euxc '
+              apk add --no-cache build-base linux-headers cmake perl
+              cargo build --release --locked --target "$TARGET"
+              "target/$TARGET/release/konyac" --version
+            '
+          file "target/${TARGET}/release/konyac"
+
+      - name: Setup Rust (macOS)
+        if: ${{ !matrix.musl_docker }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache (macOS)
+        if: ${{ !matrix.musl_docker }}
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build macOS binary
+        if: ${{ !matrix.musl_docker }}
+        shell: bash
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}"
+          "target/${{ matrix.target }}/release/konyac" --version
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          TARGET="${{ matrix.target }}"
+          NAME="konyac-${TAG}-${TARGET}"
+          STAGE="dist/${NAME}"
+          mkdir -p "$STAGE"
+          cp "target/${TARGET}/release/konyac" "$STAGE/konyac"
+          chmod 755 "$STAGE/konyac"
+          cp LICENSE README.md config.example.toml "$STAGE/"
+          if [[ "$TARGET" == *"-linux-"* ]]; then
+            cp packaging/systemd/konyac.service "$STAGE/konyac.service"
+          fi
+          tar -C dist -czf "dist/${NAME}.tar.gz" "$NAME"
+          rm -rf "$STAGE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        working-directory: dist
+        run: |
+          sha256sum konyac-*.tar.gz | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/konyac-*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" dist/konyac-*.tar.gz dist/SHA256SUMS \
+              --title "$TAG" \
+              --generate-notes
+          fi
+
+      - name: Update Homebrew Tap (if HOMEBREW_TAP_TOKEN is configured)
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set; skipping automatic Homebrew Tap update."
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"
+          sha_for() {
+            awk -v f="konyac-${TAG}-${1}.tar.gz" '$2 == f { print $1 }' dist/SHA256SUMS
+          }
+          SHA_DARWIN_ARM64="$(sha_for aarch64-apple-darwin)"
+          SHA_DARWIN_X86_64="$(sha_for x86_64-apple-darwin)"
+          SHA_LINUX_ARM64="$(sha_for aarch64-unknown-linux-musl)"
+          SHA_LINUX_X86_64="$(sha_for x86_64-unknown-linux-musl)"
+
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/lh330250925/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/konyac.rb <<EOF
+          class Konyac < Formula
+            desc "Lightweight AI translation daemon and CLI for Linux and macOS"
+            homepage "https://github.com/lh330250925/Konyac"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/lh330250925/Konyac/releases/download/v#{version}/konyac-v#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_DARWIN_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/lh330250925/Konyac/releases/download/v#{version}/konyac-v#{version}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_DARWIN_X86_64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/lh330250925/Konyac/releases/download/v#{version}/konyac-v#{version}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_LINUX_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/lh330250925/Konyac/releases/download/v#{version}/konyac-v#{version}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_LINUX_X86_64}"
+              end
+            end
+
+            def install
+              bin.install "konyac"
+              pkgshare.install "config.example.toml"
+            end
+
+            def caveats
+              <<~EOS
+                Create your configuration before starting the daemon:
+                  mkdir -p ~/.config/konyac
+                  cp #{opt_pkgshare}/config.example.toml ~/.config/konyac/config.toml
+
+                Then start the background daemon with:
+                  brew services start konyac
+              EOS
+            end
+
+            service do
+              run [opt_bin/"konyac", "serve"]
+              keep_alive true
+              log_path var/"log/konyac.log"
+              error_log_path var/"log/konyac.log"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/konyac --version")
+            end
+          end
+          EOF
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/konyac.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "konyac ${VERSION}"
+            git push origin HEAD
+          fi
