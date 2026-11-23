@@ -1,0 +1,32 @@
+# Maintainer: lockhain <lh330250925@outlook.com>
+pkgname=konyac-bin
+pkgver=0.1.1
+pkgrel=1
+pkgdesc='Lightweight AI translation daemon and CLI supporting OpenAI, Anthropic, and Gemini'
+arch=('x86_64' 'aarch64')
+url='https://github.com/lh330250925/Konyac'
+license=('MIT')
+provides=('konyac')
+conflicts=('konyac')
+options=('!debug' '!strip')
+
+source_x86_64=("konyac-v${pkgver}-x86_64-unknown-linux-musl.tar.gz::${url}/releases/download/v${pkgver}/konyac-v${pkgver}-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("konyac-v${pkgver}-aarch64-unknown-linux-musl.tar.gz::${url}/releases/download/v${pkgver}/konyac-v${pkgver}-aarch64-unknown-linux-musl.tar.gz")
+sha256sums_x86_64=('7c84954b6fef5122a71846405207c748c141de55aa9039b91e2335529945ba3a')
+sha256sums_aarch64=('9252d78cb90f32a68d3d736456c92865547e08b98a6fa1b7b996565e6de1233d')
+
+package() {
+  local arch_target
+  case "$CARCH" in
+    x86_64) arch_target="x86_64-unknown-linux-musl" ;;
+    aarch64) arch_target="aarch64-unknown-linux-musl" ;;
+    *) return 1 ;;
+  esac
+
+  cd "${srcdir}/konyac-v${pkgver}-${arch_target}"
+  install -Dm755 konyac "${pkgdir}/usr/bin/konyac"
+  install -Dm644 konyac.service "${pkgdir}/usr/lib/systemd/user/konyac.service"
+  install -Dm644 config.example.toml "${pkgdir}/usr/share/doc/konyac/config.example.toml"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/konyac/README.md"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
